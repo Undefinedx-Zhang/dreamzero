@@ -764,7 +764,7 @@ def main(args: Args) -> None:
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
 
     # Use TE cuDNN backend for attention.
-    os.environ["ATTENTION_BACKEND"] = "TE"
+    # os.environ["ATTENTION_BACKEND"] = "TE"  # Disabled: requires transformer-engine package
 
     # Increase the recompile limit to 100 for inference due
     # to autoregressive nature of the model (several possible shapes).
