@@ -1383,7 +1383,14 @@ class WANPolicyHead(ActionHead):
             model_path = LOAD_TRT_ENGINE
             self.trt_engine = trt_utils.load_tensorrt_engine(model_path, model_type="ar_14B")
 
-    def parallelize(self, device_mesh: DeviceMesh) -> None:
+    def parallelize(self, device_mesh: DeviceMesh | None) -> None:
+        # Skip parallelization in single GPU mode
+        if device_mesh is None:
+            self.ip_rank = 0
+            self.ip_size = 1
+            self.ip_group = None
+            return
+
         ip_mesh = device_mesh["ip"]
         self.ip_rank = ip_mesh.get_local_rank()
         self.ip_size = ip_mesh.size()

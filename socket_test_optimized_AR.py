@@ -57,7 +57,7 @@ class ARDroidRoboarenaPolicy:
     def __init__(
         self,
         groot_policy: GrootSimPolicy,
-        signal_group: dist.ProcessGroup,
+        signal_group: dist.ProcessGroup | None,
         output_dir: str | None = None,
     ) -> None:
         self._policy = groot_policy
@@ -228,16 +228,20 @@ class ARDroidRoboarenaPolicy:
     
     def _broadcast_batch_to_workers(self, obs: dict) -> None:
         """Broadcast batch data from rank 0 to all other ranks."""
+        # Skip in single GPU mode
+        if self._signal_group is None:
+            return
+
         import pickle
-        
+
         # Serialize the obs
         serialized = pickle.dumps(obs)
         data_size = len(serialized)
-        
+
         # Broadcast size first
         size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
         dist.broadcast(size_tensor, src=0)
-        
+
         # Broadcast data
         data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
         dist.broadcast(data_tensor, src=0)
@@ -269,20 +273,23 @@ class ARDroidRoboarenaPolicy:
         converted_obs = self._convert_observation(obs)
         
         # Signal workers to continue (0 = continue)
-        signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
-        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+        if self._signal_group is not None:
+            signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+            dist.broadcast(signal_tensor, src=0, group=self._signal_group)
         
         # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
         
         # Create batch for policy
         batch = Batch(obs=converted_obs)
-        
-        # Distributed forward pass
-        dist.barrier()
+
+        # Distributed forward pass (skip barrier in single GPU mode)
+        if self._signal_group is not None:
+            dist.barrier()
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-        dist.barrier()
+        if self._signal_group is not None:
+            dist.barrier()
         
         # Store video predictions for potential saving
         self.video_across_time.append(video_pred)
@@ -530,6 +537,10 @@ class WebsocketPolicyServer:
 
     def _broadcast_batch_to_workers(self, obs):
         """Broadcast batch data from rank 0 to all other ranks."""
+        # Skip in single GPU mode
+        if self._signal_group is None:
+            return
+
         import pickle
 
         # Serialize the obs
@@ -565,20 +576,23 @@ class WebsocketPolicyServer:
 
                     infer_start_time = time.perf_counter()
 
-                    # Signal other ranks to continue (0 = continue)
-                    signal_tensor.zero_() 
-                    dist.broadcast(signal_tensor, src=0, group=self._signal_group) # <-- USE GLOO GROUP
+                    # Signal other ranks to continue (0 = continue) - skip in single GPU mode
+                    if self._signal_group is not None:
+                        signal_tensor.zero_()
+                        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
 
                     # Broadcast the obs to all ranks for distributed inference
                     self._broadcast_batch_to_workers(obs)
                     batch = Batch(obs=obs)
 
-                    # All ranks need to participate in the forward pass
-                    dist.barrier()
+                    # All ranks need to participate in the forward pass - skip barrier in single GPU mode
+                    if self._signal_group is not None:
+                        dist.barrier()
                     forward_start_time = time.perf_counter()
                     with torch.no_grad():
                         result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
-                    dist.barrier()
+                    if self._signal_group is not None:
+                        dist.barrier()
                     print(f"Forward Time: {time.perf_counter() - forward_start_time:.2f} seconds")
 
                     action_chunk_dict = result_batch.act
@@ -705,14 +719,22 @@ class WebsocketPolicyServer:
                     raise
         finally:
             logger.info(f"Rank 0: Client session ended. Sending idle signal (2) to workers.")
-            signal_tensor.fill_(2)  # Set tensor value to 2
-            dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+            if self._signal_group is not None:
+                signal_tensor.fill_(2)  # Set tensor value to 2
+                dist.broadcast(signal_tensor, src=0, group=self._signal_group)
             # When connection closes, signal other ranks to continue waiting for next connection
             # (or implement proper shutdown if needed)
 
 
-def init_mesh() -> DeviceMesh:
-    # env vars set by torchrun
+def init_mesh() -> DeviceMesh | None:
+    # Check if running in distributed mode (via torchrun)
+    if "RANK" not in os.environ:
+        # Single GPU mode
+        print("Running in single GPU mode")
+        torch.cuda.set_device(0)
+        return None
+
+    # Distributed mode (via torchrun)
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -757,11 +779,19 @@ def main(args: Args) -> None:
     }
 
     device_mesh = init_mesh()
-    rank = dist.get_rank()
 
-    timeout_delta = datetime.timedelta(seconds=args.timeout_seconds)
-    signal_group = dist.new_group(backend="gloo", timeout=timeout_delta)
-    logger.info(f"Rank {rank} initialized signal_group (gloo)")
+    # Handle single GPU vs distributed mode
+    if device_mesh is None:
+        # Single GPU mode
+        rank = 0
+        signal_group = None
+        logger.info("Running in single GPU mode - no distributed communication")
+    else:
+        # Distributed mode
+        rank = dist.get_rank()
+        timeout_delta = datetime.timedelta(seconds=args.timeout_seconds)
+        signal_group = dist.new_group(backend="gloo", timeout=timeout_delta)
+        logger.info(f"Rank {rank} initialized signal_group (gloo)")
 
     policy = GrootSimPolicy(
         embodiment_tag=EmbodimentTag(embodiment_tag),
