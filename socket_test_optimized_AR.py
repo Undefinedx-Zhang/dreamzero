@@ -39,6 +39,7 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    no_save_video: bool = False  # Disable saving predicted videos
 
 
 class ARDroidRoboarenaPolicy:
@@ -806,14 +807,17 @@ def main(args: Args) -> None:
 
     if rank == 0:
         logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
-        # Create output directory for videos
-        # Extract parent directory and checkpoint name from model_path
-        parent_dir = os.path.dirname(model_path)
-        date_suffix = datetime.datetime.now().strftime("%Y%m%d")
-        checkpoint_name = os.path.basename(model_path)
-        output_dir = os.path.join(parent_dir, f"real_world_eval_gen_{date_suffix}_{args.index}", checkpoint_name)
-        os.makedirs(output_dir, exist_ok=True)
-        logging.info("Videos will be saved to: %s", output_dir)
+        if args.no_save_video:
+            output_dir = None
+            logging.info("Video saving disabled (--no-save-video)")
+        else:
+            # Create output directory for videos
+            parent_dir = os.path.dirname(model_path)
+            date_suffix = datetime.datetime.now().strftime("%Y%m%d")
+            checkpoint_name = os.path.basename(model_path)
+            output_dir = os.path.join(parent_dir, f"real_world_eval_gen_{date_suffix}_{args.index}", checkpoint_name)
+            os.makedirs(output_dir, exist_ok=True)
+            logging.info("Videos will be saved to: %s", output_dir)
     else:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
@@ -827,7 +831,7 @@ def main(args: Args) -> None:
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
     server_config = PolicyServerConfig(
-        image_resolution=(180, 320),  # AR_droid expects 180x320 images
+        image_resolution=(160, 320),  # AR_droid expects 180x320 images
         needs_wrist_camera=True,
         n_external_cameras=2,
         needs_stereo_camera=False,
