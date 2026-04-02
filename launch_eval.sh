@@ -77,7 +77,7 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
 
     RETRIES=0
     MAX_RETRIES=600  # 10 minutes per server
-    while ! python3 -c "import websockets.sync.client; c=websockets.sync.client.connect('ws://localhost:$PORT', open_timeout=2); c.recv(); c.close()" > /dev/null 2>&1; do
+    while ! curl -s "http://localhost:$PORT/healthz" > /dev/null 2>&1; do
         sleep 1
         RETRIES=$((RETRIES + 1))
         if [ $RETRIES -ge $MAX_RETRIES ]; then
