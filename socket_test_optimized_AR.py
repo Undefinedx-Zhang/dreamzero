@@ -40,6 +40,7 @@ class Args:
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
     no_save_video: bool = False  # Disable saving predicted videos
+    image_height: int = 180  # 14B model: 180, 5B model: 160
 
 
 class ARDroidRoboarenaPolicy:
@@ -831,7 +832,7 @@ def main(args: Args) -> None:
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
     server_config = PolicyServerConfig(
-        image_resolution=(160, 320),  # AR_droid expects 180x320 images
+        image_resolution=(args.image_height, 320),
         needs_wrist_camera=True,
         n_external_cameras=2,
         needs_stereo_camera=False,
