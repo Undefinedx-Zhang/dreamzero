@@ -103,6 +103,12 @@ class WebsocketPolicyServer:
                 await websocket.send(to_return)
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
+                # Save any unsaved timing data for the last episode
+                if hasattr(self._policy, '_reset_state'):
+                    try:
+                        self._policy._reset_state(save_video=False)
+                    except Exception as e:
+                        logging.warning(f"Failed to save timing on disconnect: {e}")
                 break
             except Exception:
                 await websocket.send(traceback.format_exc())

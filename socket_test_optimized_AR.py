@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import logging
 import socket
 import asyncio
@@ -31,6 +32,20 @@ from eval_utils.policy_server import PolicyServerConfig
 
 logger = logging.getLogger(__name__)
 
+
+def _json_default(obj):
+    """Handle numpy types that json.dumps cannot serialize by default."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
 @dataclasses.dataclass
 class Args:
     port: int = 8000
@@ -41,6 +56,7 @@ class Args:
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
     no_save_video: bool = False  # Disable saving predicted videos
     image_height: int = 180  # 14B model: 180, 5B model: 160
+    recent_ref_only: bool = False  # Only keep first + latest reference frame KV cache
 
 
 class ARDroidRoboarenaPolicy:
@@ -81,7 +97,22 @@ class ARDroidRoboarenaPolicy:
         # Video across time for saving (similar to original server)
         self.video_across_time = []
         self._msg_index = 0
-        
+
+        # Per-chunk inference timing for current episode
+        self._step_times: list[dict[str, float]] = []
+        # Accumulated per-episode timing results
+        self._episode_timing_results: list[dict] = []
+        self._episode_counter = 0
+        # Path for timing report
+        timing_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._timing_report_path = os.path.join(
+            output_dir or ".", f"inference_timing_{timing_ts}.jsonl"
+        )
+        # Episode metadata (success, object_category) sent from client via reset
+        self._pending_episode_meta: dict = {}
+        # Buffer for records that failed to write (retried on next save)
+        self._pending_write_records: list[dict] = []
+
         # Create output directory if specified
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
@@ -262,63 +293,129 @@ class ARDroidRoboarenaPolicy:
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
                 logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
+                # Pick up episode metadata if passed via observation
+                for k in ("success", "object_category"):
+                    if k in obs and obs[k] is not None:
+                        self._pending_episode_meta[k] = obs[k]
                 # Reset state for new session
                 self._reset_state()
+                self._pending_episode_meta = {}
             else:
                 logger.info(f"New session started: '{session_id}'")
             self._current_session_id = session_id
         
         self._msg_index += 1
         self._call_count += 1
-        
+
+        t_total_start = time.perf_counter()
+
         # Convert observation format
         converted_obs = self._convert_observation(obs)
-        
+
         # Signal workers to continue (0 = continue)
         if self._signal_group is not None:
             signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
             dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
+
         # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
-        
+
         # Create batch for policy
         batch = Batch(obs=converted_obs)
 
         # Distributed forward pass (skip barrier in single GPU mode)
         if self._signal_group is not None:
             dist.barrier()
+        t_forward_start = time.perf_counter()
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         if self._signal_group is not None:
             dist.barrier()
-        
+        t_forward = time.perf_counter() - t_forward_start
+
         # Store video predictions for potential saving
         self.video_across_time.append(video_pred)
-        
+
         # Extract and convert action
         action_chunk_dict = result_batch.act
-        
+
         # Convert Batch to dict
         action_dict = {}
         for k in dir(action_chunk_dict):
             if k.startswith("action."):
                 action_dict[k] = getattr(action_chunk_dict, k)
-        
+
         action = self._convert_action(action_dict)
-        
+
+        t_total = time.perf_counter() - t_total_start
+
+        # Record step timing
+        self._step_times.append({
+            "chunk": self._call_count,
+            "forward_sec": round(t_forward, 4),
+            "total_sec": round(t_total, 4),
+        })
+        logger.info(
+            f"[Timing] chunk={self._call_count}  forward={t_forward:.3f}s  total={t_total:.3f}s"
+        )
+
         # Update first call flag
         if self._is_first_call:
             self._is_first_call = False
-        
+
         return action
     
     def _reset_state(self, save_video: bool = True) -> None:
         """Internal method to reset policy state.
-        
+
         Args:
             save_video: Whether to save accumulated video before reset.
         """
+        # Summarize and save timing for this episode
+        if self._step_times:
+            forward_times = [s["forward_sec"] for s in self._step_times]
+            total_times = [s["total_sec"] for s in self._step_times]
+            episode_record = {
+                "episode": self._episode_counter,
+                "session_id": self._current_session_id,
+                "success": self._pending_episode_meta.get("success"),
+                "object_category": self._pending_episode_meta.get("object_category"),
+                "num_chunks": len(self._step_times),
+                "total_inference_sec": round(sum(total_times), 4),
+                "total_forward_sec": round(sum(forward_times), 4),
+                "avg_forward_sec": round(sum(forward_times) / len(forward_times), 4),
+                "min_forward_sec": round(min(forward_times), 4),
+                "max_forward_sec": round(max(forward_times), 4),
+                "avg_total_sec": round(sum(total_times) / len(total_times), 4),
+                "per_chunk": self._step_times,
+            }
+            self._episode_timing_results.append(episode_record)
+            logger.info(
+                f"[Timing] Episode {self._episode_counter} done: "
+                f"{len(self._step_times)} chunks, "
+                f"total_forward={sum(forward_times):.2f}s, "
+                f"avg_forward={sum(forward_times)/len(forward_times):.3f}s"
+            )
+            # Append to JSONL file (flush any previously failed records first)
+            if self._timing_report_path:
+                pending = self._pending_write_records + [episode_record]
+                try:
+                    with open(self._timing_report_path, "a") as f:
+                        for rec in pending:
+                            f.write(json.dumps(rec, default=_json_default) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    self._pending_write_records = []
+                except Exception as e:
+                    # Save to pending buffer so next _reset_state() retries
+                    self._pending_write_records = pending
+                    logger.error(
+                        f"Failed to write timing report for episode "
+                        f"{self._episode_counter} ({len(pending)} records pending): {e}"
+                    )
+            self._episode_counter += 1
+            self._step_times = []
+
         # Optionally save accumulated video before reset
         if save_video and len(self.video_across_time) > 0 and self._output_dir:
             try:
@@ -361,10 +458,19 @@ class ARDroidRoboarenaPolicy:
     
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
-        
+
         Clears frame buffers and resets call count.
+        Accepts optional episode metadata (success, object_category) from the client
+        describing the episode that just finished.
         """
+        # Store metadata from the finished episode before resetting
+        self._pending_episode_meta = {
+            k: reset_info.get(k)
+            for k in ("success", "object_category")
+            if reset_info.get(k) is not None
+        }
         self._reset_state(save_video=True)
+        self._pending_episode_meta = {}
 
 
 class WebsocketPolicyServer:
@@ -801,6 +907,10 @@ def main(args: Args) -> None:
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
     )
+
+    if args.recent_ref_only:
+        policy.trained_model.action_head.recent_ref_only = True
+        logging.info("Recent-ref-only KV cache mode enabled: keeping first frame + latest reference only")
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()

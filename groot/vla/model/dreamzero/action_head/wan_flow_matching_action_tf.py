@@ -202,8 +202,13 @@ class WANPolicyHead(ActionHead):
         self.ip_rank = 0
         self.ip_size = 1
         self.ip_group = None
-        
+
         self._device = "cuda"
+
+        # Train-free optimization: only keep first frame + latest reference frame KV cache
+        self.recent_ref_only: bool = False
+        self._first_frame_kv_cache1: KVCacheType | None = None
+        self._first_frame_kv_cache_neg: KVCacheType | None = None
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
 
 
@@ -1126,6 +1131,9 @@ class WANPolicyHead(ActionHead):
                 dtype=noise_obs.dtype,
                 device=noise_obs.device,
             )
+            if self.recent_ref_only:
+                self._first_frame_kv_cache1 = None
+                self._first_frame_kv_cache_neg = None
 
         assert self.kv_cache1 is not None
         assert self.kv_cache_neg is not None
@@ -1161,8 +1169,19 @@ class WANPolicyHead(ActionHead):
                 ),
             )
             self.current_start_frame += 1
-            
+            # Save first-frame KV cache for recent_ref_only mode
+            if self.recent_ref_only:
+                self._first_frame_kv_cache1 = [kv.clone() for kv in self.kv_cache1]
+                self._first_frame_kv_cache_neg = [kv.clone() for kv in self.kv_cache_neg]
+
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
+
+        # Reset KV cache to first-frame-only before adding new reference
+        if self.recent_ref_only and self.current_start_frame != 1:
+            assert self._first_frame_kv_cache1 is not None
+            for i in range(len(self.kv_cache1)):
+                self.kv_cache1[i] = self._first_frame_kv_cache1[i].clone()
+                self.kv_cache_neg[i] = self._first_frame_kv_cache_neg[i].clone()
 
         if self.current_start_frame != 1:
             current_ref_latents = image[:, -self.num_frame_per_block:]
