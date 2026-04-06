@@ -57,6 +57,7 @@ class Args:
     no_save_video: bool = False  # Disable saving predicted videos
     image_height: int = 180  # 14B model: 180, 5B model: 160
     recent_ref_only: bool = False  # Only keep first + latest reference frame KV cache
+    serve_output: str = ""  # Directory for server output files (timing jsonl, logs). Defaults to cwd.
 
 
 class ARDroidRoboarenaPolicy:
@@ -77,10 +78,12 @@ class ARDroidRoboarenaPolicy:
         groot_policy: GrootSimPolicy,
         signal_group: dist.ProcessGroup | None,
         output_dir: str | None = None,
+        serve_output_dir: str | None = None,
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._output_dir = output_dir
+        self._serve_output_dir = serve_output_dir
         
         # Frame buffers for accumulation (per camera view)
         self._frame_buffers: dict[str, list[np.ndarray]] = {
@@ -103,20 +106,23 @@ class ARDroidRoboarenaPolicy:
         # Accumulated per-episode timing results
         self._episode_timing_results: list[dict] = []
         self._episode_counter = 0
-        # Path for timing report
+        # Path for timing report (prefer serve_output_dir, then output_dir, then cwd)
         timing_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timing_dir = serve_output_dir or output_dir or "."
         self._timing_report_path = os.path.join(
-            output_dir or ".", f"inference_timing_{timing_ts}.jsonl"
+            timing_dir, f"inference_timing_{timing_ts}.jsonl"
         )
         # Episode metadata (success, object_category) sent from client via reset
         self._pending_episode_meta: dict = {}
         # Buffer for records that failed to write (retried on next save)
         self._pending_write_records: list[dict] = []
 
-        # Create output directory if specified
+        # Create output directories if specified
+        if self._serve_output_dir:
+            os.makedirs(self._serve_output_dir, exist_ok=True)
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
-    
+
     def _convert_observation(self, obs: dict) -> dict:
         """Convert roboarena observation format to AR_droid format.
         
@@ -164,10 +170,15 @@ class ARDroidRoboarenaPolicy:
         else:
             # Subsequent calls: use exactly FRAMES_PER_CHUNK frames
             num_frames = self.FRAMES_PER_CHUNK
-        
+
         # Build video tensors from accumulated frames
+        max_keep = max(num_frames, self.FRAMES_PER_CHUNK)
         for droid_key, buffer in self._frame_buffers.items():
             if len(buffer) > 0:
+                # Trim buffer to avoid unbounded memory growth
+                if len(buffer) > max_keep:
+                    self._frame_buffers[droid_key] = buffer[-max_keep:]
+                    buffer = self._frame_buffers[droid_key]
                 if len(buffer) >= num_frames:
                     # Take the last num_frames frames
                     frames_to_use = buffer[-num_frames:]
@@ -333,8 +344,11 @@ class ARDroidRoboarenaPolicy:
             dist.barrier()
         t_forward = time.perf_counter() - t_forward_start
 
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
+        # Store video predictions only when saving is enabled
+        if self._output_dir:
+            self.video_across_time.append(video_pred)
+        else:
+            del video_pred
 
         # Extract and convert action
         action_chunk_dict = result_batch.act
@@ -389,7 +403,8 @@ class ARDroidRoboarenaPolicy:
                 "avg_total_sec": round(sum(total_times) / len(total_times), 4),
                 "per_chunk": self._step_times,
             }
-            self._episode_timing_results.append(episode_record)
+            # Only keep last episode result in memory (full history is in JSONL file)
+            self._episode_timing_results = [episode_record]
             logger.info(
                 f"[Timing] Episode {self._episode_counter} done: "
                 f"{len(self._step_times)} chunks, "
@@ -916,6 +931,9 @@ def main(args: Args) -> None:
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
 
+    # Resolve serve_output directory
+    serve_output_dir = args.serve_output if args.serve_output else None
+
     if rank == 0:
         logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
         if args.no_save_video:
@@ -929,15 +947,18 @@ def main(args: Args) -> None:
             output_dir = os.path.join(parent_dir, f"real_world_eval_gen_{date_suffix}_{args.index}", checkpoint_name)
             os.makedirs(output_dir, exist_ok=True)
             logging.info("Videos will be saved to: %s", output_dir)
+        if serve_output_dir:
+            logging.info("Server output files will be saved to: %s", serve_output_dir)
     else:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
-    
+
     # Create wrapper policy that converts between roboarena and AR_droid formats
     wrapper_policy = ARDroidRoboarenaPolicy(
         groot_policy=policy,
         signal_group=signal_group,
         output_dir=output_dir,
+        serve_output_dir=serve_output_dir,
     )
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)

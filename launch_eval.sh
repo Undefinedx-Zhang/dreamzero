@@ -30,6 +30,7 @@ CLIENT_CONDA_ENV="mlspaces"
 DREAMZERO_DIR="/home/jianzhang/zdj/dreamzero"
 MOLMOSPACES_DIR="/home/jianzhang/zdj/molmospaces"
 IMAGE_HEIGHT=180
+SERVE_OUTPUT=""
 EXTRA_SERVER_ARGS=""
 EXTRA_CLIENT_ARGS=""
 
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --checkpoint-path) CHECKPOINT_PATH="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --image-height) IMAGE_HEIGHT="$2"; shift 2 ;;
+        --serve-output) SERVE_OUTPUT="$2"; shift 2 ;;
         --server-conda-env) SERVER_CONDA_ENV="$2"; shift 2 ;;
         --client-conda-env) CLIENT_CONDA_ENV="$2"; shift 2 ;;
         --wandb) EXTRA_CLIENT_ARGS="$EXTRA_CLIENT_ARGS --wandb"; shift ;;
@@ -65,8 +67,16 @@ echo "  Ports:          $BASE_PORT - $((BASE_PORT + NUM_INSTANCES - 1))"
 echo "  Benchmark:      $BENCHMARK_DIR"
 echo "  Checkpoint:     $CHECKPOINT_PATH"
 echo "  Output:         $OUTPUT_DIR"
+echo "  Serve output:   ${SERVE_OUTPUT:-<cwd>}"
 echo "  Image height:   $IMAGE_HEIGHT (14B=180, 5B=160)"
 echo ""
+
+# Build serve-output args for server
+SERVE_OUTPUT_ARGS=""
+if [[ -n "$SERVE_OUTPUT" ]]; then
+    mkdir -p "$SERVE_OUTPUT"
+    SERVE_OUTPUT_ARGS="--serve-output $SERVE_OUTPUT"
+fi
 
 # ---- Start servers one by one (wait for each to be ready before starting next) ----
 echo "Starting $NUM_INSTANCES server instances (sequentially to avoid GPU conflicts)..."
@@ -74,7 +84,8 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     PORT=$((BASE_PORT + i))
     SESSION="server_${i}"
     tmux kill-session -t "$SESSION" 2>/dev/null || true
-    tmux new -d -s "$SESSION" "bash -c '$CONDA_INIT && conda activate $SERVER_CONDA_ENV && cd $DREAMZERO_DIR && CUDA_VISIBLE_DEVICES=$GPUS python -m torch.distributed.run --standalone --nproc_per_node=2 --master_port=$((29500 + i)) socket_test_optimized_AR.py --port $PORT --enable-dit-cache --model-path $CHECKPOINT_PATH --no-save-video --image-height $IMAGE_HEIGHT $EXTRA_SERVER_ARGS 2>&1 | tee $DREAMZERO_DIR/server_${i}.log; exec bash'"
+    SERVER_LOG="${SERVE_OUTPUT:-$DREAMZERO_DIR}/server_${i}.log"
+    tmux new -d -s "$SESSION" "bash -c '$CONDA_INIT && conda activate $SERVER_CONDA_ENV && cd $DREAMZERO_DIR && CUDA_VISIBLE_DEVICES=$GPUS python -m torch.distributed.run --standalone --nproc_per_node=2 --master_port=$((29500 + i)) socket_test_optimized_AR.py --port $PORT --enable-dit-cache --model-path $CHECKPOINT_PATH --no-save-video --image-height $IMAGE_HEIGHT $SERVE_OUTPUT_ARGS $EXTRA_SERVER_ARGS 2>&1 | tee $SERVER_LOG; exec bash'"
     echo -n "  [server_$i] port=$PORT — waiting for ready..."
 
     RETRIES=0
@@ -119,9 +130,9 @@ echo "  for i in \$(seq 0 $((NUM_INSTANCES - 1))); do tmux kill-session -t serve
 #   /home/jianzhang/zdj/molmospaces_assets/benchmarks/molmospaces-bench-v1/procthor-10k/FrankaPickDroidMiniBench/FrankaPickDroidMiniBench_json_benchmark_20251231 \
 #     --checkpoint-path /home/jianzhang/zdj/Droid_5B_18k \
 #     --wandb --no-save-data
-# --image-height 180  
+# --image-height 180 
 # --recent-ref-only
-
+# --serve-output /home/jianzhang/zdj/dreamzero/eval_runs/run_001
 
 
 #   tmux kill-session -t server_0; tmux kill-session -t server_1; tmux kill-session -t server_2
