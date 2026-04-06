@@ -30,6 +30,7 @@ CLIENT_CONDA_ENV="mlspaces"
 DREAMZERO_DIR="/home/jianzhang/zdj/dreamzero"
 MOLMOSPACES_DIR="/home/jianzhang/zdj/molmospaces"
 IMAGE_HEIGHT=180
+EXTRA_SERVER_ARGS=""
 EXTRA_CLIENT_ARGS=""
 
 # ---- Parse args ----
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --wandb) EXTRA_CLIENT_ARGS="$EXTRA_CLIENT_ARGS --wandb"; shift ;;
         --no-save-data) EXTRA_CLIENT_ARGS="$EXTRA_CLIENT_ARGS --no-save-data"; shift ;;
         --no-save-video) EXTRA_CLIENT_ARGS="$EXTRA_CLIENT_ARGS --no-save-video"; shift ;;
+        --recent-ref-only) EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS --recent-ref-only"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -72,7 +74,7 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     PORT=$((BASE_PORT + i))
     SESSION="server_${i}"
     tmux kill-session -t "$SESSION" 2>/dev/null || true
-    tmux new -d -s "$SESSION" "bash -c '$CONDA_INIT && conda activate $SERVER_CONDA_ENV && cd $DREAMZERO_DIR && CUDA_VISIBLE_DEVICES=$GPUS python -m torch.distributed.run --standalone --nproc_per_node=2 --master_port=$((29500 + i)) socket_test_optimized_AR.py --port $PORT --enable-dit-cache --model-path $CHECKPOINT_PATH --no-save-video --image-height $IMAGE_HEIGHT 2>&1 | tee $DREAMZERO_DIR/server_${i}.log; exec bash'"
+    tmux new -d -s "$SESSION" "bash -c '$CONDA_INIT && conda activate $SERVER_CONDA_ENV && cd $DREAMZERO_DIR && CUDA_VISIBLE_DEVICES=$GPUS python -m torch.distributed.run --standalone --nproc_per_node=2 --master_port=$((29500 + i)) socket_test_optimized_AR.py --port $PORT --enable-dit-cache --model-path $CHECKPOINT_PATH --no-save-video --image-height $IMAGE_HEIGHT $EXTRA_SERVER_ARGS 2>&1 | tee $DREAMZERO_DIR/server_${i}.log; exec bash'"
     echo -n "  [server_$i] port=$PORT — waiting for ready..."
 
     RETRIES=0
@@ -118,6 +120,8 @@ echo "  for i in \$(seq 0 $((NUM_INSTANCES - 1))); do tmux kill-session -t serve
 #     --checkpoint-path /home/jianzhang/zdj/Droid_5B_18k \
 #     --wandb --no-save-data
 # --image-height 180  
+# --recent-ref-only
+
 
 
 #   tmux kill-session -t server_0; tmux kill-session -t server_1; tmux kill-session -t server_2
