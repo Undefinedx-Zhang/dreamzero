@@ -48,6 +48,10 @@ action_head_cfg:
     freeze_decode_layer: false
     expand_batch: ${expand_batch}
     use_vlln: true
+    # Video noise token pruning (inference only)
+    enable_video_token_pruning: false
+    pruning_score_layer: 20
+    pruning_schedule: null
     vl_self_attention_cfg:
       _target_: groot.vla.model.n1_5.modules.cross_attention_dit.SelfAttentionTransformer
       positional_embeddings: null

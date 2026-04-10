@@ -143,6 +143,36 @@ class WANPolicyHeadConfig(PretrainedConfig):
     use_vlln: bool = field(default=True)
     defer_lora_injection: bool = field(default=False, metadata={"help": "Defer LoRA injection until after loading pretrained weights."})
 
+    # Video noise token pruning — prune unimportant video tokens based on action attention scores
+    enable_video_token_pruning: bool = field(
+        default=False, metadata={"help": "Enable video noise token pruning during inference."}
+    )
+    pruning_score_layer: int = field(
+        default=20, metadata={"help": "DiT layer index at which to compute importance scores and start pruning."}
+    )
+    pruning_schedule: list[float] | None = field(
+        default=None, metadata={"help": "Per-scheduler-step keep ratios (length = num_inference_steps). 1.0 = no pruning. None = use default schedule."}
+    )
+    pruning_scatter_mode: str = field(
+        default="stale",
+        metadata={"help": "How to reconstruct pruned tokens during scatter-back. "
+                  "'stale': use cached hidden states (original). "
+                  "'interpolate': linearly interpolate update deltas from kept tokens to reduce stale gap."}
+    )
+    pruning_rescore_interval: int = field(
+        default=0,
+        metadata={"help": "Re-compute importance scores every N denoising steps. 0 = score once (original behavior)."}
+    )
+    training_pruning_prob: float = field(
+        default=0.0,
+        metadata={"help": "Probability of applying random token pruning during training (0.0 = disabled). "
+                  "When >0, randomly drops video tokens at pruning_score_layer to build robustness."}
+    )
+    training_pruning_keep_range: tuple[float, float] = field(
+        default=(0.25, 0.75),
+        metadata={"help": "Range of keep ratios to sample uniformly during pruning-aware training."}
+    )
+
     vl_self_attention_cfg: dict = field(default=None)
     text_encoder_cfg: dict = field(default=None)
     image_encoder_cfg: dict = field(default=None)
@@ -764,19 +794,27 @@ class WANPolicyHead(ActionHead):
 
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
+            _train_prune_kwargs = dict(
+                training_pruning_prob=self.config.training_pruning_prob,
+                training_pruning_keep_range=self.config.training_pruning_keep_range,
+                pruning_score_layer=self.config.pruning_score_layer,
+            ) if self.config.training_pruning_prob > 0 else {}
+
             if actions.numel() > 0:
                 video_noise_pred, action_noise_pred = self.model(
                     noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
-                    action=noisy_actions, timestep_action=timestep_action, 
+                    action=noisy_actions, timestep_action=timestep_action,
                     clean_x=latents.transpose(1, 2),
+                    **_train_prune_kwargs,
                 )
             else:
                 video_noise_pred, action_noise_pred = self.model(
-                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action, 
+                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action,
                     clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
                     clean_x=latents.transpose(1, 2),
+                    **_train_prune_kwargs,
                 )
 
             # Per-sample dynamics loss
@@ -869,8 +907,12 @@ class WANPolicyHead(ActionHead):
         kv_caches: list[KVCacheType],
         crossattn_caches: list[KVCacheType],
         kv_cache_metadata: dict[str, bool | int],
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        keep_ratio: float = 1.0,
+        prune_indices: torch.Tensor | None = None,
+        scatter_mode: str = "stale",
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor | None]:
         predictions = []
+        output_prune_indices = None
         for index, prompt_emb in enumerate(context):
             kv_cache = kv_caches[index]
             crossattn_cache = crossattn_caches[index]
@@ -887,7 +929,7 @@ class WANPolicyHead(ActionHead):
                     kv_cache=kv_cache,
                 )
             else:
-                obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
+                obs_noise_pred, action_noise_pred, updated_kv_caches, new_prune_indices = self.model(
                     noisy_input,
                     timestep,
                     action=action,
@@ -901,17 +943,24 @@ class WANPolicyHead(ActionHead):
                     kv_cache=kv_cache,
                     crossattn_cache=crossattn_cache,
                     current_start_frame=kv_cache_metadata["start_frame"],
+                    keep_ratio=keep_ratio,
+                    prune_indices=prune_indices,
+                    pruning_score_layer=self.config.pruning_score_layer if self.config.enable_video_token_pruning else 99,
+                    scatter_mode=scatter_mode,
                 )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
                         kv_cache[block_index] = updated_kv_cache.clone()
+                # Capture prune_indices from the first (cond) pass
+                if new_prune_indices is not None and output_prune_indices is None:
+                    output_prune_indices = new_prune_indices
             obs_noise_pred = obs_noise_pred.clone()
             if action_noise_pred is not None:
                 action_noise_pred = action_noise_pred.clone()
             else:
                 action_noise_pred = torch.tensor(0.0, device=obs_noise_pred.device) # dummy action noise prediction
             predictions.append((obs_noise_pred, action_noise_pred))
-        return self._exchange_predictions(predictions)
+        return self._exchange_predictions(predictions), output_prune_indices
 
     def _exchange_predictions(
         self,
@@ -1242,9 +1291,40 @@ class WANPolicyHead(ActionHead):
 
         start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
         end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        prev_predictions = [] 
+        prev_predictions = []
         self.skip_countdown = 0
         dit_compute_steps = 0
+
+        # Video noise token pruning schedule
+        _pruning_enabled = self.config.enable_video_token_pruning
+        _num_steps = len(sample_scheduler.timesteps)
+        if self.config.pruning_schedule is not None:
+            _pruning_schedule = self.config.pruning_schedule
+            # Auto-adapt: if user schedule is shorter than num_steps, repeat last value;
+            # if longer, truncate
+            if len(_pruning_schedule) < _num_steps:
+                _pruning_schedule = _pruning_schedule + [_pruning_schedule[-1]] * (_num_steps - len(_pruning_schedule))
+            elif len(_pruning_schedule) > _num_steps:
+                _pruning_schedule = _pruning_schedule[:_num_steps]
+        else:
+            # Default: monotonically decreasing schedule — no pruning in first 1/8 of steps,
+            # then linearly ramp from 1.0 down to 0.25 over remaining steps.
+            # This avoids the oscillation of the old schedule and gives a smooth compute ramp-down.
+            _warmup = max(_num_steps // 8, 1)
+            _pruning_schedule = []
+            for i in range(_num_steps):
+                if i < _warmup:
+                    _pruning_schedule.append(1.0)
+                else:
+                    # Linear ramp: 1.0 at warmup end → 0.25 at last step
+                    t = (i - _warmup) / max(_num_steps - _warmup - 1, 1)
+                    _pruning_schedule.append(1.0 - 0.75 * t)
+        # Importance-ordered indices from scoring (most important first).
+        # Denoising loop derives position-sorted subsets per step for progressive pruning.
+        _importance_indices: torch.Tensor | None = None
+        _rescore_interval = self.config.pruning_rescore_interval if _pruning_enabled else 0
+        _steps_since_score = 0  # Count of pruned steps since last importance scoring
+
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
@@ -1272,7 +1352,29 @@ class WANPolicyHead(ActionHead):
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
-                predictions = self._run_diffusion_steps(
+                # Determine pruning keep_ratio for this scheduler step
+                _keep_ratio = _pruning_schedule[min(index, len(_pruning_schedule) - 1)] if _pruning_enabled else 1.0
+
+                # Dynamic rescoring: invalidate cached indices when interval elapsed
+                _force_rescore = (
+                    _rescore_interval > 0
+                    and _importance_indices is not None
+                    and _steps_since_score >= _rescore_interval
+                    and _keep_ratio < 1.0
+                )
+                if _force_rescore:
+                    _importance_indices = None
+                    _steps_since_score = 0
+
+                # Derive position-sorted prune_indices for this step from cached importance order
+                _current_prune_indices: torch.Tensor | None = None
+                if _importance_indices is not None and _keep_ratio < 1.0:
+                    target_K = max(int(seq_len * _keep_ratio), 1)
+                    target_K = min(target_K, _importance_indices.shape[1])
+                    subset = _importance_indices[:, :target_K]  # top-K most important
+                    _current_prune_indices = subset.sort(dim=-1).values  # position-sorted
+
+                predictions, new_prune_indices = self._run_diffusion_steps(
                     noisy_input=noisy_input.transpose(1, 2),
                     timestep=timestep,
                     action=noisy_input_action,
@@ -1289,7 +1391,17 @@ class WANPolicyHead(ActionHead):
                         start_frame=self.current_start_frame,
                         update_kv_cache=False,
                     ),
+                    keep_ratio=_keep_ratio,
+                    prune_indices=_current_prune_indices,
+                    scatter_mode=self.config.pruning_scatter_mode if _pruning_enabled else "stale",
                 )
+                # Cache/update importance-ordered indices from scoring
+                if new_prune_indices is not None:
+                    _importance_indices = new_prune_indices
+                    _steps_since_score = 0
+                elif _keep_ratio < 1.0:
+                    _steps_since_score += 1
+
                 flow_pred_cond, flow_pred_cond_action = predictions[0]
                 flow_pred_uncond, flow_pred_uncond_action = predictions[1]
 

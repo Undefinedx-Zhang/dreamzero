@@ -793,12 +793,17 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        compute_importance: bool = False,
+        keep_ratio: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            x(Tensor): Shape [B, L, num_heads, C / num_heads]. When pruning is active,
+                       L = K + action_register_length (compressed by _forward_blocks).
+            freqs(Tensor): Rope freqs for video positions. When pruning is active,
+                          shape [K, ...] (compressed to match kept video tokens).
+            compute_importance(bool): If True, compute importance scores at this layer.
+            keep_ratio(float): Fraction of video tokens to keep (only used with compute_importance).
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -812,6 +817,7 @@ class CausalWanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         updated_kv_cache: torch.Tensor | None = None
+        new_prune_indices: torch.Tensor | None = None
 
         if kv_cache is None:
             if is_tf:
@@ -1072,6 +1078,26 @@ class CausalWanSelfAttention(nn.Module):
             new_k = new_k[:, -self.max_attention_size:]
             new_v = new_v[:, -self.max_attention_size:]
 
+            # Compute importance scores for video token pruning (scoring layer only)
+            # When pruning is active (input already compressed by _forward_blocks),
+            # this block does NOT fire — compute_importance is only True at the scoring layer
+            # where x is still full-size.
+            new_prune_indices = None
+            if compute_importance and action_register_length is not None and keep_ratio < 1.0:
+                # Manual matmul: action Q vs new video K (before concat with cache)
+                # roped_action_query: [B, 33, H, D], roped_key: [B, 1760, H, D]
+                scores = torch.einsum('bqhd,bkhd->bhqk', roped_action_query, roped_key)
+                scores = scores / (roped_action_query.shape[-1] ** 0.5)
+                importance = scores.float().softmax(dim=-1).mean(dim=(1, 2))  # [B, 1760]
+                num_keep = max(int(num_new_tokens * keep_ratio), 1)
+                _, new_prune_indices = importance.topk(num_keep, dim=-1)  # [B, K] importance-ordered
+                # NOTE: returned in importance order (most important first).
+                # _forward_blocks sorts by position for gather; denoising loop caches
+                # importance order for progressive sub-selection.
+
+            # Standard attention (handles both full and compressed input)
+            # When compressed: roped_query=[B,K,H,D], roped_key=[B,K,H,D] (K kept video tokens)
+            # KV concat: [cache + K new video + 33 action/state]
             if action_register_length is not None:
                 x = self.attn(
                     torch.cat([roped_query, roped_action_query], dim=1),
@@ -1090,7 +1116,7 @@ class CausalWanSelfAttention(nn.Module):
         # output
         x = x.flatten(2)
         x = self.o(x)
-        return x, updated_kv_cache
+        return x, updated_kv_cache, new_prune_indices
 
 
 class CausalWanAttentionBlock(nn.Module):
@@ -1161,12 +1187,16 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        compute_importance: bool = False,
+        keep_ratio: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         r"""
         Args:
-            x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, F, 6, C]
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            x(Tensor): Shape [B, L, C]. When pruning is active, L = K + action_register_length.
+            e(Tensor): Shape [B, L, 6, C]. Compressed to match x when pruning.
+            freqs(Tensor): Rope freqs for video positions. Compressed when pruning.
+            compute_importance(bool): If True, this is the scoring layer — compute importance scores
+            keep_ratio(float): Fraction of video tokens to keep (only used when compute_importance=True)
         """
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
@@ -1185,7 +1215,7 @@ class CausalWanAttentionBlock(nn.Module):
         e = tuple(aligned)
 
         # self-attention
-        y, updated_kv_cache = self.self_attn(
+        y, updated_kv_cache, new_prune_indices = self.self_attn(
             x=(self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)),
             freqs=freqs,
             freqs_action=freqs_action,
@@ -1194,6 +1224,8 @@ class CausalWanAttentionBlock(nn.Module):
             kv_cache=kv_cache,
             is_tf=is_tf,
             current_start_frame=current_start_frame,
+            compute_importance=compute_importance,
+            keep_ratio=keep_ratio,
         )
         x = x + (y * e[2].squeeze(2))
 
@@ -1207,7 +1239,7 @@ class CausalWanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, e)
-        return x, updated_kv_cache
+        return x, updated_kv_cache, new_prune_indices
 
 
 class CausalHead(nn.Module):
@@ -1742,7 +1774,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         state: torch.Tensor | None,
         kv_cache: list[torch.Tensor],
         current_start_frame: int,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        keep_ratio: float = 1.0,
+        prune_indices: torch.Tensor | None = None,
+        pruning_score_layer: int = 20,
+        scatter_mode: str = "stale",
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor], torch.Tensor | None]:
         r"""
         Forward pass through the diffusion model blocks.
         """
@@ -1794,19 +1830,155 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context = torch.cat([clip_embedding, context], dim=1)
 
         updated_kv_caches: list[torch.Tensor] = []
+        pruned_video_cache: torch.Tensor | None = None  # Cached hidden states of pruned video tokens
+        # prune_indices from denoising loop are always POSITION-SORTED (ready for gather)
+        active_prune_indices = prune_indices
+        num_keep = None
+        importance_ordered_indices: torch.Tensor | None = None  # For progressive sub-selection
+
+        active_freqs = freqs
+        computed_new_indices = False
+
+        # If prune_indices provided from a prior denoising step, compress x + e0 + freqs
+        if active_prune_indices is not None and action_register_length is not None:
+            num_keep = active_prune_indices.shape[1]
+            video_x = x[:, :seq_len]
+            action_x = x[:, seq_len:]
+            pruned_video_cache = video_x.clone()
+
+            idx = active_prune_indices.unsqueeze(-1).expand(-1, -1, video_x.shape[-1])
+            kept_video_x = torch.gather(video_x, 1, idx)
+            x = torch.cat([kept_video_x, action_x], dim=1)
+
+            e_video = e0[:, :seq_len]
+            e_action = e0[:, seq_len:]
+            kept_e_video = torch.gather(
+                e_video, 1,
+                active_prune_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, e_video.shape[2], e_video.shape[3])
+            )
+            e0 = torch.cat([kept_e_video, e_action], dim=1)
+
+            # Compress freqs: [seq_len, ...] → [K, ...]
+            # freqs has no batch dim; assert all batch elements share the same position indices
+            # (always true for batch_size=1 inference; guard against future batch>1 misuse)
+            if active_prune_indices.shape[0] > 1:
+                assert torch.equal(active_prune_indices[0], active_prune_indices[-1]), (
+                    f"Video token pruning with batch>1 requires identical position indices across batch, "
+                    f"but batch[0] and batch[{active_prune_indices.shape[0]-1}] differ. "
+                    f"This is unsupported because freqs (RoPE) has no batch dimension."
+                )
+            active_freqs = freqs[active_prune_indices[0]]
+
         for block_index, block in enumerate(self.blocks):
-            x, updated_kv_cache = block(
+            # Determine if this block should compute importance scores
+            should_compute = (
+                block_index == pruning_score_layer
+                and keep_ratio < 1.0
+                and active_prune_indices is None  # Only compute if not already pruning
+                and action_register_length is not None
+            )
+
+            x, updated_kv_cache, new_block_prune_indices = block(
                 x=x,
                 e=e0,
-                freqs=freqs,
+                freqs=active_freqs,
                 freqs_action=self.freqs_action,
                 freqs_state=self.freqs_state,
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index],
                 current_start_frame=current_start_frame,
+                compute_importance=should_compute,
+                keep_ratio=keep_ratio,
             )
             updated_kv_caches.append(updated_kv_cache)
+
+            # At the scoring layer: gather kept tokens, cache pruned video hidden states
+            if new_block_prune_indices is not None and active_prune_indices is None:
+                # new_block_prune_indices is importance-ordered (most important first)
+                importance_ordered_indices = new_block_prune_indices
+                # Sort by position for gather/RoPE correctness
+                active_prune_indices = new_block_prune_indices.sort(dim=-1).values
+                computed_new_indices = True
+                num_keep = active_prune_indices.shape[1]
+
+                # x is [B, seq_len + action_register_length, D] — split video vs action/state
+                video_x = x[:, :seq_len]         # [B, 1760, D]
+                action_x = x[:, seq_len:]        # [B, 33, D]
+
+                # Cache full video hidden states for scatter-back later
+                pruned_video_cache = video_x.clone()
+
+                # Gather kept video tokens (using position-sorted indices)
+                idx = active_prune_indices.unsqueeze(-1).expand(-1, -1, video_x.shape[-1])
+                kept_video_x = torch.gather(video_x, 1, idx)  # [B, K, D]
+
+                # Compress x: [B, K + 33, D]
+                x = torch.cat([kept_video_x, action_x], dim=1)
+
+                # Compress e0 (modulation) to match compressed x
+                e_video = e0[:, :seq_len]
+                e_action = e0[:, seq_len:]
+                kept_e_video = torch.gather(
+                    e_video, 1,
+                    active_prune_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, e_video.shape[2], e_video.shape[3])
+                )
+                e0 = torch.cat([kept_e_video, e_action], dim=1)
+
+                # Compress freqs: [seq_len, ...] → [K, ...]
+                if active_prune_indices.shape[0] > 1:
+                    assert torch.equal(active_prune_indices[0], active_prune_indices[-1]), (
+                        f"Video token pruning with batch>1 requires identical position indices across batch, "
+                        f"but batch[0] and batch[{active_prune_indices.shape[0]-1}] differ."
+                    )
+                active_freqs = freqs[active_prune_indices[0]]
+
+        # Scatter kept video tokens back into full sequence
+        if active_prune_indices is not None and pruned_video_cache is not None:
+            # x is [B, K + action_register_length, D]
+            kept_video_out = x[:, :num_keep]
+            action_out = x[:, num_keep:]
+
+            idx = active_prune_indices.unsqueeze(-1).expand_as(kept_video_out)
+
+            if scatter_mode == "interpolate":
+                # Interpolate update deltas from kept tokens to reduce stale gap for pruned tokens.
+                _orig_dtype = pruned_video_cache.dtype
+
+                # 1. Compute delta = how much each kept token changed through the transformer layers
+                kept_stale = torch.gather(pruned_video_cache, 1, idx)  # [B, K, D]
+                kept_delta = kept_video_out - kept_stale  # [B, K, D]
+
+                # 2. For each position in [0, seq_len), interpolate delta from left/right nearest kept tokens
+                positions = torch.arange(seq_len, device=kept_video_out.device, dtype=torch.float32)
+                kept_positions = active_prune_indices[0].float()  # [K] (position-sorted)
+
+                right_idx = torch.searchsorted(kept_positions, positions).clamp(0, num_keep - 1)
+                left_idx = (right_idx - 1).clamp(0, num_keep - 1)
+
+                right_pos = kept_positions[right_idx]
+                left_pos = kept_positions[left_idx]
+                span = (right_pos - left_pos).clamp(min=1.0)
+                w_right = ((positions - left_pos) / span).clamp(0, 1).to(_orig_dtype)
+                w_left = (1.0 - w_right)  # [seq_len]
+
+                interp_delta = (
+                    w_left.unsqueeze(0).unsqueeze(-1) * kept_delta[:, left_idx]
+                    + w_right.unsqueeze(0).unsqueeze(-1) * kept_delta[:, right_idx]
+                )  # [B, seq_len, D]
+
+                # 3. Apply interpolated delta to stale cache, then override kept positions exactly
+                full_video = pruned_video_cache + interp_delta
+                full_video = full_video.scatter(1, idx, kept_video_out)
+            else:
+                # Original "stale" mode: pruned tokens keep their cached hidden states
+                full_video = pruned_video_cache
+                full_video = full_video.scatter(1, idx, kept_video_out)
+
+            x = torch.cat([full_video, action_out], dim=1)  # [B, seq_len + action_register_length, D]
+
+        # Return importance-ordered indices (for progressive sub-selection in denoising loop)
+        output_prune_indices = importance_ordered_indices if computed_new_indices else None
 
         if action is not None:
             action_noise_pred = x[:, seq_len: seq_len + action_length]
@@ -1821,7 +1993,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # Unpatchify video-only tokens
         x_video = self.head(x_video, e_video.unsqueeze(2))
 
-        return x_video, action_noise_pred, updated_kv_caches
+        return x_video, action_noise_pred, updated_kv_caches, output_prune_indices
 
 
     def _forward_inference_trt(
@@ -1847,7 +2019,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block_index in range(len(self.blocks)):
             kv_cache_list.append(kv_cache_packed[block_index])
         
-        x_video, action_noise_pred, _ = self._forward_inference(
+        x_video, action_noise_pred, _, _ = self._forward_inference(
             x=x,
             timestep=timestep,
             context=context,
@@ -1887,7 +2059,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block_index in range(len(self.blocks)):
             kv_cache_list.append(kv_cache_packed[block_index])
         
-        x_video, action_noise_pred, _ = self._forward_inference(
+        x_video, action_noise_pred, _, _ = self._forward_inference(
             x=x,
             timestep=timestep,
             context=context,
@@ -1920,7 +2092,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         timestep_action=None,
         state=None,
         embodiment_id=None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        keep_ratio: float = 1.0,
+        prune_indices: torch.Tensor | None = None,
+        pruning_score_layer: int = 20,
+        scatter_mode: str = "stale",
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor], torch.Tensor | None]:
         r"""
         Run the diffusion model with kv caching.
         See Algorithm 2 of CausVid paper https://arxiv.org/abs/2412.07772 for details.
@@ -1969,7 +2145,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             start_frame=current_start_frame,
         )
 
-        x_video, action_noise_pred, updated_kv_caches = self._forward_blocks(
+        x_video, action_noise_pred, updated_kv_caches, output_prune_indices = self._forward_blocks(
             x=x,
             seq_len=seq_len,
             freqs=freqs,
@@ -1982,6 +2158,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             state=state,
             kv_cache=kv_cache,
             current_start_frame=current_start_frame,
+            keep_ratio=keep_ratio,
+            prune_indices=prune_indices,
+            pruning_score_layer=pruning_score_layer,
+            scatter_mode=scatter_mode,
         )
 
         # Copy the updated KV caches back to the original KV cache.
@@ -1993,7 +2173,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         video_noise_pred = self.unpatchify(x_video, grid_size)
 
-        return video_noise_pred, action_noise_pred, updated_kv_caches
+        return video_noise_pred, action_noise_pred, updated_kv_caches, output_prune_indices
 
     def _forward_train(
         self,
@@ -2009,6 +2189,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         action=None,
         state=None,
         embodiment_id=None,
+        training_pruning_prob: float = 0.0,
+        training_pruning_keep_range: tuple[float, float] = (0.25, 0.75),
+        pruning_score_layer: int = 20,
     ):
         r"""
         Forward pass through the diffusion model
@@ -2127,12 +2310,62 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
-                outputs, updated_kv_cache = module(*inputs, **kwargs)
+                outputs, updated_kv_cache, _prune = module(*inputs, **kwargs)
                 assert updated_kv_cache is None
                 return outputs
             return custom_forward
 
-        for block in self.blocks:
+        # Pruning-aware training: randomly prune video tokens at pruning_score_layer
+        _apply_train_pruning = (
+            training_pruning_prob > 0.0
+            and action_register_length is not None
+            and clean_x is None  # Skip for teacher-forcing (clean_x) mode to keep it simple
+            and torch.rand(1).item() < training_pruning_prob
+        )
+        _train_keep_ratio = 0.0
+        if _apply_train_pruning:
+            lo, hi = training_pruning_keep_range
+            _train_keep_ratio = lo + (hi - lo) * torch.rand(1).item()
+
+        _pruned_video_cache = None
+        _active_prune_indices = None
+        _num_keep = None
+
+        for block_idx, block in enumerate(self.blocks):
+            # At the scoring layer during pruning-aware training: compute importance and compress
+            if _apply_train_pruning and block_idx == pruning_score_layer and _active_prune_indices is None:
+                # Run this block with compute_importance=True to get scores
+                x, _, new_prune_indices = block(
+                    x, compute_importance=True, keep_ratio=_train_keep_ratio, **kwargs,
+                )
+                if new_prune_indices is not None:
+                    # Sort by position for gather correctness
+                    _active_prune_indices = new_prune_indices.sort(dim=-1).values
+                    _num_keep = _active_prune_indices.shape[1]
+
+                    # Split video vs action/state
+                    video_x = x[:, :seq_len]
+                    action_x = x[:, seq_len:]
+                    _pruned_video_cache = video_x  # Keep reference (not clone) for gradient flow
+
+                    # Gather kept video tokens
+                    idx = _active_prune_indices.unsqueeze(-1).expand(-1, -1, video_x.shape[-1])
+                    kept_video_x = torch.gather(video_x, 1, idx)
+                    x = torch.cat([kept_video_x, action_x], dim=1)
+
+                    # Compress e0 and freqs
+                    e_video_k = kwargs['e'][:, :seq_len]
+                    e_action_k = kwargs['e'][:, seq_len:]
+                    kept_e = torch.gather(
+                        e_video_k, 1,
+                        _active_prune_indices.unsqueeze(-1).unsqueeze(-1).expand(
+                            -1, -1, e_video_k.shape[2], e_video_k.shape[3])
+                    )
+                    kwargs = dict(kwargs)  # Shallow copy to avoid mutating original
+                    kwargs['e'] = torch.cat([kept_e, e_action_k], dim=1)
+                    kwargs['freqs'] = freqs[_active_prune_indices[0]]
+                continue  # Block already processed above
+
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
@@ -2140,7 +2373,35 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                x, _, _ = block(x, **kwargs)
+
+        # Scatter back pruned tokens for training
+        if _active_prune_indices is not None and _pruned_video_cache is not None:
+            kept_video_out = x[:, :_num_keep]
+            action_out = x[:, _num_keep:]
+
+            # Interpolate update deltas for pruned tokens (same as inference interpolate mode)
+            idx = _active_prune_indices.unsqueeze(-1).expand_as(kept_video_out)
+            kept_stale = torch.gather(_pruned_video_cache, 1, idx)
+            kept_delta = kept_video_out - kept_stale
+
+            positions = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+            kept_positions = _active_prune_indices[0].float()
+            right_idx = torch.searchsorted(kept_positions, positions).clamp(0, _num_keep - 1)
+            left_idx = (right_idx - 1).clamp(0, _num_keep - 1)
+            right_pos = kept_positions[right_idx]
+            left_pos = kept_positions[left_idx]
+            span = (right_pos - left_pos).clamp(min=1.0)
+            w_right = ((positions - left_pos) / span).clamp(0, 1)
+            w_left = 1.0 - w_right
+
+            interp_delta = (
+                w_left.unsqueeze(0).unsqueeze(-1) * kept_delta[:, left_idx]
+                + w_right.unsqueeze(0).unsqueeze(-1) * kept_delta[:, right_idx]
+            )
+            full_video = _pruned_video_cache + interp_delta
+            full_video = full_video.scatter(1, idx, kept_video_out)
+            x = torch.cat([full_video, action_out], dim=1)
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]
