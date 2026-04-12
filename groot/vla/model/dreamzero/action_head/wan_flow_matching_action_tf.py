@@ -172,6 +172,11 @@ class WANPolicyHeadConfig(PretrainedConfig):
         default=(0.25, 0.75),
         metadata={"help": "Range of keep ratios to sample uniformly during pruning-aware training."}
     )
+    pruning_mode: str = field(
+        default="per_step",
+        metadata={"help": "Token pruning mode. 'per_step': independent pruning each denoising step (original). "
+                  "'progressive': cumulative elimination — each step prunes from the surviving set, tokens never return."}
+    )
 
     vl_self_attention_cfg: dict = field(default=None)
     text_encoder_cfg: dict = field(default=None)
@@ -910,6 +915,8 @@ class WANPolicyHead(ActionHead):
         keep_ratio: float = 1.0,
         prune_indices: torch.Tensor | None = None,
         scatter_mode: str = "stale",
+        alive_indices: torch.Tensor | None = None,
+        target_alive: int | None = None,
     ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor | None]:
         predictions = []
         output_prune_indices = None
@@ -947,6 +954,8 @@ class WANPolicyHead(ActionHead):
                     prune_indices=prune_indices,
                     pruning_score_layer=self.config.pruning_score_layer if self.config.enable_video_token_pruning else 99,
                     scatter_mode=scatter_mode,
+                    alive_indices=alive_indices,
+                    target_alive=target_alive,
                 )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
@@ -954,6 +963,11 @@ class WANPolicyHead(ActionHead):
                 # Capture prune_indices from the first (cond) pass
                 if new_prune_indices is not None and output_prune_indices is None:
                     output_prune_indices = new_prune_indices
+                    # Progressive mode: ensure the uncond pass uses the same alive set
+                    # as the cond pass (avoid CFG mismatch from independent scoring)
+                    if alive_indices is not None:
+                        alive_indices = new_prune_indices
+                        target_alive = None  # don't re-score in uncond pass
             obs_noise_pred = obs_noise_pred.clone()
             if action_noise_pred is not None:
                 action_noise_pred = action_noise_pred.clone()
@@ -1297,42 +1311,45 @@ class WANPolicyHead(ActionHead):
 
         # Video noise token pruning schedule
         _pruning_enabled = self.config.enable_video_token_pruning
+        _progressive = _pruning_enabled and self.config.pruning_mode == 'progressive'
         _num_steps = len(sample_scheduler.timesteps)
         if self.config.pruning_schedule is not None:
             _pruning_schedule = self.config.pruning_schedule
-            # Auto-adapt: if user schedule is shorter than num_steps, repeat last value;
-            # if longer, truncate
             if len(_pruning_schedule) < _num_steps:
                 _pruning_schedule = _pruning_schedule + [_pruning_schedule[-1]] * (_num_steps - len(_pruning_schedule))
             elif len(_pruning_schedule) > _num_steps:
                 _pruning_schedule = _pruning_schedule[:_num_steps]
         else:
-            # Default: monotonically decreasing schedule — no pruning in first 1/8 of steps,
-            # then linearly ramp from 1.0 down to 0.25 over remaining steps.
-            # This avoids the oscillation of the old schedule and gives a smooth compute ramp-down.
             _warmup = max(_num_steps // 8, 1)
             _pruning_schedule = []
             for i in range(_num_steps):
                 if i < _warmup:
                     _pruning_schedule.append(1.0)
                 else:
-                    # Linear ramp: 1.0 at warmup end → 0.25 at last step
                     t = (i - _warmup) / max(_num_steps - _warmup - 1, 1)
                     _pruning_schedule.append(1.0 - 0.75 * t)
-        # Importance-ordered indices from scoring (most important first).
-        # Denoising loop derives position-sorted subsets per step for progressive pruning.
+
+        # Per-step mode state
         _importance_indices: torch.Tensor | None = None
         _rescore_interval = self.config.pruning_rescore_interval if _pruning_enabled else 0
-        _steps_since_score = 0  # Count of pruned steps since last importance scoring
+        _steps_since_score = 0
+
+        # Progressive mode state: alive_indices tracks surviving tokens across steps
+        # Initialize to all positions so step 0 also enters the progressive path
+        # (avoids falling through to per-step which returns importance-ordered indices)
+        _alive_indices: torch.Tensor | None = (
+            torch.arange(seq_len, device=noise_obs.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            if _progressive else None
+        )
 
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
-            # Get timesteps from respective schedulers
             action_timestep = sample_scheduler_action.timesteps[index]
-            video_timestep = sample_scheduler.timesteps[index]  # Already rescaled if decoupled
+            video_timestep = sample_scheduler.timesteps[index]
 
-            # set current timestep
             timestep = torch.ones(
                 [batch_size, self.num_frame_per_block],
                 device=noise_obs.device,
@@ -1344,7 +1361,6 @@ class WANPolicyHead(ActionHead):
                 dtype=torch.int64,
             ) * action_timestep
 
-            # check if we need to run the DIT step
             should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
             if should_run_model:
                 dit_compute_steps += 1
@@ -1352,55 +1368,83 @@ class WANPolicyHead(ActionHead):
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
-                # Determine pruning keep_ratio for this scheduler step
+
                 _keep_ratio = _pruning_schedule[min(index, len(_pruning_schedule) - 1)] if _pruning_enabled else 1.0
 
-                # Dynamic rescoring: invalidate cached indices when interval elapsed
-                _force_rescore = (
-                    _rescore_interval > 0
-                    and _importance_indices is not None
-                    and _steps_since_score >= _rescore_interval
-                    and _keep_ratio < 1.0
-                )
-                if _force_rescore:
-                    _importance_indices = None
-                    _steps_since_score = 0
+                if _progressive:
+                    # Progressive mode: pass alive_indices, compute target_alive from schedule
+                    _target_alive_count = max(int(seq_len * _keep_ratio), 1)
+                    # Only shrink, never grow
+                    if _alive_indices is not None and _target_alive_count >= _alive_indices.shape[1]:
+                        _target_alive_count = None  # no further pruning this step
+                    predictions, new_alive = self._run_diffusion_steps(
+                        noisy_input=noisy_input.transpose(1, 2),
+                        timestep=timestep,
+                        action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state=state_features,
+                        embodiment_id=embodiment_id,
+                        context=prompt_embs,
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        kv_cache_metadata=dict(
+                            start_frame=self.current_start_frame,
+                            update_kv_cache=False,
+                        ),
+                        alive_indices=_alive_indices,
+                        target_alive=_target_alive_count,
+                    )
+                    # Update alive set (monotonically shrinking)
+                    if new_alive is not None:
+                        _alive_indices = new_alive
+                else:
+                    # Per-step mode (original behavior)
+                    _force_rescore = (
+                        _rescore_interval > 0
+                        and _importance_indices is not None
+                        and _steps_since_score >= _rescore_interval
+                        and _keep_ratio < 1.0
+                    )
+                    if _force_rescore:
+                        _importance_indices = None
+                        _steps_since_score = 0
 
-                # Derive position-sorted prune_indices for this step from cached importance order
-                _current_prune_indices: torch.Tensor | None = None
-                if _importance_indices is not None and _keep_ratio < 1.0:
-                    target_K = max(int(seq_len * _keep_ratio), 1)
-                    target_K = min(target_K, _importance_indices.shape[1])
-                    subset = _importance_indices[:, :target_K]  # top-K most important
-                    _current_prune_indices = subset.sort(dim=-1).values  # position-sorted
+                    _current_prune_indices: torch.Tensor | None = None
+                    if _importance_indices is not None and _keep_ratio < 1.0:
+                        target_K = max(int(seq_len * _keep_ratio), 1)
+                        target_K = min(target_K, _importance_indices.shape[1])
+                        subset = _importance_indices[:, :target_K]
+                        _current_prune_indices = subset.sort(dim=-1).values
 
-                predictions, new_prune_indices = self._run_diffusion_steps(
-                    noisy_input=noisy_input.transpose(1, 2),
-                    timestep=timestep,
-                    action=noisy_input_action,
-                    timestep_action=timestep_action,
-                    state=state_features,
-                    embodiment_id=embodiment_id,
-                    context=prompt_embs,
-                    seq_len=seq_len,
-                    y=y,
-                    clip_feature=self.clip_feas,
-                    kv_caches=kv_caches,
-                    crossattn_caches=crossattn_caches,
-                    kv_cache_metadata=dict(
-                        start_frame=self.current_start_frame,
-                        update_kv_cache=False,
-                    ),
-                    keep_ratio=_keep_ratio,
-                    prune_indices=_current_prune_indices,
-                    scatter_mode=self.config.pruning_scatter_mode if _pruning_enabled else "stale",
-                )
-                # Cache/update importance-ordered indices from scoring
-                if new_prune_indices is not None:
-                    _importance_indices = new_prune_indices
-                    _steps_since_score = 0
-                elif _keep_ratio < 1.0:
-                    _steps_since_score += 1
+                    predictions, new_prune_indices = self._run_diffusion_steps(
+                        noisy_input=noisy_input.transpose(1, 2),
+                        timestep=timestep,
+                        action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state=state_features,
+                        embodiment_id=embodiment_id,
+                        context=prompt_embs,
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        kv_cache_metadata=dict(
+                            start_frame=self.current_start_frame,
+                            update_kv_cache=False,
+                        ),
+                        keep_ratio=_keep_ratio,
+                        prune_indices=_current_prune_indices,
+                        scatter_mode=self.config.pruning_scatter_mode if _pruning_enabled else "stale",
+                    )
+                    if new_prune_indices is not None:
+                        _importance_indices = new_prune_indices
+                        _steps_since_score = 0
+                    elif _keep_ratio < 1.0:
+                        _steps_since_score += 1
 
                 flow_pred_cond, flow_pred_cond_action = predictions[0]
                 flow_pred_uncond, flow_pred_uncond_action = predictions[1]

@@ -1,16 +1,5 @@
 #!/bin/bash
 # launch_eval.sh - Launch N parallel server+client pairs for faster evaluation.
-#
-# Usage:
-#   bash launch_eval.sh \
-#     --num-instances 3 \
-#     --gpus 0,1 \
-#     --benchmark-dir /path/to/benchmark \
-#     --checkpoint-path /path/to/checkpoint \
-#     --output-dir ./eval_output
-#
-# Each instance gets its own server (on ports 6000, 6001, ...) and client shard.
-# Memory: ~20GB/GPU per instance. With 85GB GPUs, 3-4 instances fit comfortably.
 
 set -euo pipefail
 
@@ -21,7 +10,7 @@ CONDA_INIT="source $CONDA_BASE/etc/profile.d/conda.sh"
 # ---- Defaults ----
 NUM_INSTANCES=2
 GPUS="0,1"
-BASE_PORT=6000
+BASE_PORT=7000
 BENCHMARK_DIR=""
 CHECKPOINT_PATH=""
 OUTPUT_DIR="./eval_output"
@@ -29,6 +18,7 @@ SERVER_CONDA_ENV="dreamzero"
 CLIENT_CONDA_ENV="mlspaces"
 DREAMZERO_DIR="/home/jianzhang/zdj/dreamzero"
 MOLMOSPACES_DIR="/home/jianzhang/zdj/molmospaces"
+ASSETS_DIR="/home/jianzhang/zdj/molmospaces_assets"
 IMAGE_HEIGHT=180
 SERVE_OUTPUT=""
 EXTRA_SERVER_ARGS=""
@@ -43,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --benchmark-dir) BENCHMARK_DIR="$2"; shift 2 ;;
         --checkpoint-path) CHECKPOINT_PATH="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --assets-dir) ASSETS_DIR="$2"; shift 2 ;;
         --image-height) IMAGE_HEIGHT="$2"; shift 2 ;;
         --serve-output) SERVE_OUTPUT="$2"; shift 2 ;;
         --server-conda-env) SERVER_CONDA_ENV="$2"; shift 2 ;;
@@ -51,6 +42,9 @@ while [[ $# -gt 0 ]]; do
         --no-save-data) EXTRA_CLIENT_ARGS="$EXTRA_CLIENT_ARGS --no-save-data"; shift ;;
         --no-save-video) EXTRA_CLIENT_ARGS="$EXTRA_CLIENT_ARGS --no-save-video"; shift ;;
         --recent-ref-only) EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS --recent-ref-only"; shift ;;
+        --enable-video-token-pruning) EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS --enable-video-token-pruning"; shift ;;
+        --pruning-score-layer) EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS --pruning-score-layer $2"; shift 2 ;;
+        --pruning-schedule) EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS --pruning-schedule $2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -108,7 +102,7 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     PORT=$((BASE_PORT + i))
     SESSION="client_${i}"
     tmux kill-session -t "$SESSION" 2>/dev/null || true
-    tmux new -d -s "$SESSION" "bash -c '$CONDA_INIT && conda activate $CLIENT_CONDA_ENV && cd $MOLMOSPACES_DIR && xvfb-run -a python run_molmo_spaces_eval.py --benchmark-dir $BENCHMARK_DIR --checkpoint-path $CHECKPOINT_PATH --host localhost --port $PORT --image-height $IMAGE_HEIGHT --num-shards $NUM_INSTANCES --shard-id $i --output-dir $OUTPUT_DIR $EXTRA_CLIENT_ARGS 2>&1 | tee $MOLMOSPACES_DIR/client_${i}.log; exec bash'"
+    tmux new -d -s "$SESSION" "bash -c '$CONDA_INIT && conda activate $CLIENT_CONDA_ENV && cd $MOLMOSPACES_DIR && xvfb-run -a python run_molmo_spaces_eval.py --benchmark-dir $BENCHMARK_DIR --checkpoint-path $CHECKPOINT_PATH --host localhost --port $PORT --image-height $IMAGE_HEIGHT --num-shards $NUM_INSTANCES --shard-id $i --output-dir $OUTPUT_DIR --assets-dir $ASSETS_DIR $EXTRA_CLIENT_ARGS 2>&1 | tee $MOLMOSPACES_DIR/client_${i}.log; exec bash'"
     echo "  [client_$i] shard=$i/$NUM_INSTANCES port=$PORT tmux=$SESSION"
 done
 
@@ -132,14 +126,37 @@ echo "  for i in \$(seq 0 $((NUM_INSTANCES - 1))); do tmux kill-session -t serve
 #     --wandb --no-save-data
 # --image-height 180 
 # --recent-ref-only
-# --serve-output /home/jianzhang/zdj/dreamzero/eval_runs/run_001
-
+# --serve-output /home/jianzhang/zdj/server_output
+# --enable-video-token-pruning
 
 #   tmux kill-session -t server_0; tmux kill-session -t server_1; tmux kill-session -t server_2
 #   tmux kill-session -t client_0; tmux kill-session -t client_1; tmux kill-session -t client_2
 
-# tmux attach -t client_0
-  # 在 molmospaces 目录下
-#   tail -f /home/jianzhang/zdj/molmospaces/client_0.log
-#   tail -f /home/jianzhang/zdj/molmospaces/client_1.log
-#   tail -f /home/jianzhang/zdj/molmospaces/client_2.log
+
+
+### prune
+#   cd /home/jianzhang/zdj/dreamzero
+
+#   bash launch_eval.sh \
+#     --num-instances 3 \
+#     --gpus 0,1 \
+#     --benchmark-dir /path/to/your/benchmark \
+#     --checkpoint-path /path/to/your/checkpoint \
+#     --enable-video-token-pruning \
+#     --wandb --no-save-data
+
+#   默认参数:
+#   - pruning_score_layer = 20（第20层计算 importance score）
+#   - pruning_schedule = [1.0, 1.0, 0.5, ..., 0.25, 0.25, 0.25]（16步，渐进式）
+
+#   如果想调参:
+#   # 更激进的剪枝（全程 keep 25%）
+#   --pruning-schedule "1.0,1.0,0.25,1.0,1.0,1.0,0.25,1.0,1.0,1.0,0.25,1.0,1.0,0.25,0.25,0.25"
+
+#   # 更保守的剪枝（全程 keep 50%）
+#   --pruning-schedule "1.0,1.0,0.5,1.0,1.0,1.0,0.5,1.0,1.0,1.0,0.5,1.0,1.0,0.5,0.5,0.5"
+
+#   # 换 scoring layer
+#   --pruning-score-layer 15
+
+#   对比基线: 不加 --enable-video-token-pruning 跑一组，对比 success rate 和 timing。

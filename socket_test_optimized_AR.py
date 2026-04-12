@@ -1,3 +1,10 @@
+# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 socket_test_optimized_AR.py --port 70
+# 00 --enable-dit-cache --model-path /home/jianzhang/zdj/Droid_14B --no-save-video --serve-output /home/jianzhang/zdj/server_output'
+
+#   --enable-video-token-pruning \
+#   --pruning-mode progressive \
+#   --pruning-schedule "1.0,0.9,0.8,0.7,0.65,0.6,0.55,0.5,0.45,0.4,0.35,0.3,0.3,0.3,0.3,0.3"
+#   --pruning_score_layer 20
 import dataclasses
 import json
 import logging
@@ -58,6 +65,12 @@ class Args:
     image_height: int = 180  # 14B model: 180, 5B model: 160
     recent_ref_only: bool = False  # Only keep first + latest reference frame KV cache
     serve_output: str = ""  # Directory for server output files (timing jsonl, logs). Defaults to cwd.
+    enable_video_token_pruning: bool = False  # Enable video noise token pruning during inference
+    pruning_score_layer: int = 20  # DiT layer at which to compute importance scores
+    pruning_schedule: str = ""  # Comma-separated keep ratios per scheduler step (length=num_inference_steps). Empty = default.
+    pruning_scatter_mode: str = "stale"  # Scatter-back mode: "stale" (original) or "interpolate" (delta interpolation)
+    pruning_rescore_interval: int = 0  # Re-compute importance every N denoising steps. 0 = one-shot scoring.
+    pruning_mode: str = "per_step"  # "per_step" (independent each step) or "progressive" (cumulative elimination)
 
 
 class ARDroidRoboarenaPolicy:
@@ -926,6 +939,25 @@ def main(args: Args) -> None:
     if args.recent_ref_only:
         policy.trained_model.action_head.recent_ref_only = True
         logging.info("Recent-ref-only KV cache mode enabled: keeping first frame + latest reference only")
+
+    if args.enable_video_token_pruning:
+        policy.trained_model.action_head.config.enable_video_token_pruning = True
+        policy.trained_model.action_head.config.pruning_score_layer = args.pruning_score_layer
+        policy.trained_model.action_head.config.pruning_scatter_mode = args.pruning_scatter_mode
+        policy.trained_model.action_head.config.pruning_rescore_interval = args.pruning_rescore_interval
+        policy.trained_model.action_head.config.pruning_mode = args.pruning_mode
+        if args.pruning_schedule:
+            policy.trained_model.action_head.config.pruning_schedule = [
+                float(x) for x in args.pruning_schedule.split(",")
+            ]
+        logging.info(
+            "Video token pruning enabled: mode=%s, score_layer=%d, scatter=%s, rescore_interval=%d, schedule=%s",
+            args.pruning_mode,
+            args.pruning_score_layer,
+            args.pruning_scatter_mode,
+            args.pruning_rescore_interval,
+            policy.trained_model.action_head.config.pruning_schedule or "default",
+        )
 
     # Create server for all ranks - rank 0 handles websocket, others run worker loop
     hostname = socket.gethostname()
